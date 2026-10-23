@@ -477,7 +477,8 @@ textarea { resize: vertical; line-height: 1.5; }
 /* ===================== 상수 ===================== */
 const BG_URL     = 'https://raw.githubusercontent.com/sae6gnicky/awardceremony/main/bgimage.png';
 const STORE_KEY  = 'woori_award_ceremony_v1';
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
 const CERT_W = 794, CERT_H = 1123;   // A4 (96dpi) 비율
 
 // 별도 회원가입/설정 없이 바로 동작하는 무료 공개 실시간 통신 서버 (다중 백업 구성)
@@ -950,31 +951,45 @@ ${list}
 
 반드시 {"title": "상장 이름", "body": "상장 본문"} 형태의 JSON으로만 답해.`;
 
-  const res = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(s.apiKey)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.9,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: { title: { type: 'STRING' }, body: { type: 'STRING' } },
-          required: ['title', 'body']
-        },
-        thinkingConfig: { thinkingBudget: 0 }
+  const bodyPayload = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.9,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: { title: { type: 'STRING' }, body: { type: 'STRING' } },
+        required: ['title', 'body']
       }
-    })
+    }
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data.error && data.error.message) || `HTTP ${res.status}`);
-  const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-  const text = parts.map(p => p.text || '').join('');
-  const m = text.match(/\{[\s\S]*\}/);
-  const obj = JSON.parse(m ? m[0] : text);
-  if (!obj.title || !obj.body) throw new Error('AI 응답 형식이 올바르지 않아요.');
-  return { title: String(obj.title).trim(), body: String(obj.body).trim() };
+
+  let lastErr = null;
+  for (const model of GEMINI_MODELS) {
+    try {
+      const res = await fetch(`${GEMINI_API_BASE}${model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: bodyPayload
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        lastErr = new Error((data.error && data.error.message) || `HTTP ${res.status}`);
+        // 모델 지원 종료/미존재 오류인 경우 다음 후보 모델로 자동 재시도
+        if (res.status === 404 || /no longer available|not found|not supported/i.test(lastErr.message)) continue;
+        throw lastErr;
+      }
+      const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+      const text = parts.map(p => p.text || '').join('');
+      const m = text.match(/\{[\s\S]*\}/);
+      const obj = JSON.parse(m ? m[0] : text);
+      if (!obj.title || !obj.body) throw new Error('AI 응답 형식이 올바르지 않아요.');
+      return { title: String(obj.title).trim(), body: String(obj.body).trim() };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('AI 모델 호출에 실패했어요.');
 }
 
 async function generateAward() {
