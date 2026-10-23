@@ -482,9 +482,10 @@ const BG_URL     = 'https://raw.githubusercontent.com/sae6gnicky/awardceremony/m
 const STORE_KEY  = 'woori_award_ceremony_v1';
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 // 구글 API 오류 메시지가 직접 권장하는 최신 모델을 1순위로, 항상 최신 Flash를 가리키는 별칭을 2순위로 둠
-const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
-const GEMINI_CACHE_KEY = 'woori_award_gemini_model_v2';
-const GEMINI_TIMEOUT_MS = 15000;   // 요청 1회 최대 대기 시간 (초과 시 다음 모델로)
+// 신규 발급 API 키에서도 100% 작동하도록 gemini-3.8-flash를 최우선 호출 (하위 구버전 제거)
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
+const GEMINI_CACHE_KEY = 'woori_award_gemini_model_v3';
+const GEMINI_TIMEOUT_MS = 20000;   // 요청 1회 최대 대기 시간
 let aiCancelCtrl = null;           // 로딩 화면의 [취소] 버튼용
 const CERT_W = 794, CERT_H = 1123;   // A4 (96dpi) 비율
 
@@ -965,7 +966,7 @@ ${list}
 반드시 {"title": "상장 이름", "body": "상장 본문"} 형태의 JSON으로만 답해.`;
 
   const baseGenConfig = {
-    temperature: 0.9,
+    temperature: 0.85,
     responseMimeType: 'application/json',
     responseSchema: {
       type: 'OBJECT',
@@ -973,17 +974,26 @@ ${list}
       required: ['title', 'body']
     }
   };
-  // 모델 세대별로 '생각(추론) 최소화' 옵션 이름이 달라서 각각 맞춰 보냄
-  function fastThinkingConfig(model) {
-    return /^gemini-(3|flash-latest)/.test(model) ? { thinkingLevel: 'low' } : { thinkingBudget: 0 };
-  }
-  function makeBody(model, basic) {
-    const cfg = basic ? baseGenConfig : Object.assign({}, baseGenConfig, { thinkingConfig: fastThinkingConfig(model) });
-    return JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: cfg });
+
+  function makeBody(mode) {
+    const cfg = Object.assign({}, baseGenConfig);
+    if (mode === 'budget0') {
+      cfg.thinkingConfig = { thinkingBudget: 0 };
+    } else if (mode === 'low') {
+      cfg.thinkingConfig = { thinkingLevel: 'LOW' };
+    } else if (mode === 'plain_json') {
+      return JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.85, responseMimeType: 'application/json' }
+      });
+    }
+    return JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: cfg
+    });
   }
 
   async function requestModel(model, payloadStr) {
-    // ⏱ 요청마다 제한 시간을 둬서, 응답이 없으면 기다리지 않고 바로 다음 모델로 넘어감
     const ctrl = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, GEMINI_TIMEOUT_MS);
@@ -1014,7 +1024,7 @@ ${list}
         if (aiCancelCtrl && aiCancelCtrl.signal.aborted) { const er = new Error('사용자가 취소했어요.'); er.cancelled = true; throw er; }
         if (timedOut) { const er = new Error(`응답 시간 초과 (${GEMINI_TIMEOUT_MS / 1000}초)`); er.retry = true; throw er; }
       }
-      if (e instanceof TypeError) e.retry = true;   // 네트워크 일시 오류
+      if (e instanceof TypeError) e.retry = true;
       throw e;
     } finally {
       clearTimeout(timer);
@@ -1022,39 +1032,40 @@ ${list}
     }
   }
 
-  // 한 번 성공한 모델/옵션을 기억해 두었다가 다음부터는 바로 그 모델로 호출 (재시도 낭비 제거)
+  // 한 번 성공한 모델과 설정(mode)을 기억해 두었다가 다음부터는 0초 만에 바로 그 조합으로 호출
   const cached = getCachedGemini();
   const order = cached && GEMINI_MODELS.includes(cached.model)
     ? [cached.model, ...GEMINI_MODELS.filter(m => m !== cached.model)]
     : GEMINI_MODELS.slice();
 
+  const allModes = ['basic', 'budget0', 'low', 'plain_json'];
   let lastErr = null;
+
   for (const model of order) {
-    const useBasicFirst = !!(cached && cached.model === model && cached.basic);
-    try {
-      const r = await requestModel(model, makeBody(model, useBasicFirst));
-      setCachedGemini(model, useBasicFirst);
-      return r;
-    } catch (e) {
-      lastErr = e;
-      if (e.cancelled) throw e;
-      // 생각 옵션 미지원(400) → 같은 모델에 기본 옵션으로 즉시 재호출
-      if (!useBasicFirst && e.status === 400 && /thinking/i.test(e.message)) {
-        try {
-          const r = await requestModel(model, makeBody(model, true));
-          setCachedGemini(model, true);
-          return r;
-        } catch (e2) {
-          lastErr = e2;
-          if (e2.cancelled) throw e2;
+    const modes = (cached && cached.model === model && allModes.includes(cached.mode))
+      ? [cached.mode, ...allModes.filter(m => m !== cached.mode)]
+      : allModes;
+
+    for (const mode of modes) {
+      try {
+        const r = await requestModel(model, makeBody(mode));
+        setCachedGemini(model, mode);
+        return r;
+      } catch (e) {
+        lastErr = e;
+        if (e.cancelled) throw e;
+        // API 키 자체가 잘못되었거나 권한 오류(401, 403)면 즉시 중단하고 안내
+        if (e.status === 401 || e.status === 403 || /API_KEY_INVALID|API key not valid/i.test(e.message || '')) {
+          throw e;
         }
-      }
-      // 모델 종료 / 시간 초과 / 서버 혼잡(429·5xx) / 응답 오류 → 다음 모델로
-      if (isModelGoneError(lastErr) || lastErr.retry || lastErr.status === 429 || lastErr.status >= 500) {
-        if (cached && cached.model === model) clearCachedGemini();
+        // 모델 미지원/종료(404 등)인 경우 다른 mode를 시도할 필요 없이 다음 모델로 이동
+        if (isModelGoneError(e)) {
+          if (cached && cached.model === model) clearCachedGemini();
+          break;
+        }
+        // 400 에러(파라미터 형식 불일치) 또는 응답 파싱 오류 시 다음 mode로 즉시 재시도
         continue;
       }
-      throw lastErr;
     }
   }
   throw lastErr || new Error('AI 모델 호출에 실패했어요.');
@@ -1066,8 +1077,8 @@ function isModelGoneError(e) {
 function getCachedGemini() {
   try { return JSON.parse(localStorage.getItem(GEMINI_CACHE_KEY)); } catch (e) { return null; }
 }
-function setCachedGemini(model, basic) {
-  try { localStorage.setItem(GEMINI_CACHE_KEY, JSON.stringify({ model, basic })); } catch (e) {}
+function setCachedGemini(model, mode) {
+  try { localStorage.setItem(GEMINI_CACHE_KEY, JSON.stringify({ model, mode })); } catch (e) {}
 }
 function clearCachedGemini() {
   try { localStorage.removeItem(GEMINI_CACHE_KEY); } catch (e) {}
