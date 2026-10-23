@@ -472,7 +472,8 @@ textarea { resize: vertical; line-height: 1.5; }
 
 <!-- 로딩 오버레이 -->
 <div id="overlay" class="overlay hidden">
-  <div class="overlay-box"><div class="spinner"></div><div id="overlayMsg">잠시만 기다려 주세요...</div></div>
+  <div class="overlay-box"><div class="spinner"></div><div id="overlayMsg">잠시만 기다려 주세요...</div>
+    <button class="btn ghost small hidden" id="btnCancelAi" style="margin-top:20px">✋ 그만 기다리기 (취소)</button></div>
 </div>
 
 <script>
@@ -483,6 +484,8 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models
 // 구글 API 오류 메시지가 직접 권장하는 최신 모델을 1순위로, 항상 최신 Flash를 가리키는 별칭을 2순위로 둠
 const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
 const GEMINI_CACHE_KEY = 'woori_award_gemini_model_v2';
+const GEMINI_TIMEOUT_MS = 15000;   // 요청 1회 최대 대기 시간 (초과 시 다음 모델로)
+let aiCancelCtrl = null;           // 로딩 화면의 [취소] 버튼용
 const CERT_W = 794, CERT_H = 1123;   // A4 (96dpi) 비율
 
 // 별도 회원가입/설정 없이 바로 동작하는 무료 공개 실시간 통신 서버 (다중 백업 구성)
@@ -970,33 +973,53 @@ ${list}
       required: ['title', 'body']
     }
   };
-  const bodyWithThinkingOff = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: Object.assign({}, baseGenConfig, { thinkingConfig: { thinkingBudget: 0 } })
-  });
-  const bodyBasic = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: baseGenConfig
-  });
+  // 모델 세대별로 '생각(추론) 최소화' 옵션 이름이 달라서 각각 맞춰 보냄
+  function fastThinkingConfig(model) {
+    return /^gemini-(3|flash-latest)/.test(model) ? { thinkingLevel: 'low' } : { thinkingBudget: 0 };
+  }
+  function makeBody(model, basic) {
+    const cfg = basic ? baseGenConfig : Object.assign({}, baseGenConfig, { thinkingConfig: fastThinkingConfig(model) });
+    return JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: cfg });
+  }
 
   async function requestModel(model, payloadStr) {
-    const res = await fetch(`${GEMINI_API_BASE}${model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payloadStr
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const err = new Error((data.error && data.error.message) || `HTTP ${res.status}`);
-      err.status = res.status;
-      throw err;
+    // ⏱ 요청마다 제한 시간을 둬서, 응답이 없으면 기다리지 않고 바로 다음 모델로 넘어감
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, GEMINI_TIMEOUT_MS);
+    const onCancel = () => ctrl.abort();
+    if (aiCancelCtrl) aiCancelCtrl.signal.addEventListener('abort', onCancel);
+    try {
+      const res = await fetch(`${GEMINI_API_BASE}${model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadStr,
+        signal: ctrl.signal
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error((data.error && data.error.message) || `HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+      }
+      const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+      const text = parts.filter(p => !p.thought).map(p => p.text || '').join('');
+      const m = text.match(/\{[\s\S]*\}/);
+      let obj;
+      try { obj = JSON.parse(m ? m[0] : text); } catch (e) { const er = new Error('AI 응답을 읽지 못했어요.'); er.retry = true; throw er; }
+      if (!obj.title || !obj.body) { const er = new Error('AI 응답 형식이 올바르지 않아요.'); er.retry = true; throw er; }
+      return { title: String(obj.title).trim(), body: String(obj.body).trim() };
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        if (aiCancelCtrl && aiCancelCtrl.signal.aborted) { const er = new Error('사용자가 취소했어요.'); er.cancelled = true; throw er; }
+        if (timedOut) { const er = new Error(`응답 시간 초과 (${GEMINI_TIMEOUT_MS / 1000}초)`); er.retry = true; throw er; }
+      }
+      if (e instanceof TypeError) e.retry = true;   // 네트워크 일시 오류
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (aiCancelCtrl) aiCancelCtrl.signal.removeEventListener('abort', onCancel);
     }
-    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-    const text = parts.map(p => p.text || '').join('');
-    const m = text.match(/\{[\s\S]*\}/);
-    const obj = JSON.parse(m ? m[0] : text);
-    if (!obj.title || !obj.body) throw new Error('AI 응답 형식이 올바르지 않아요.');
-    return { title: String(obj.title).trim(), body: String(obj.body).trim() };
   }
 
   // 한 번 성공한 모델/옵션을 기억해 두었다가 다음부터는 바로 그 모델로 호출 (재시도 낭비 제거)
@@ -1007,25 +1030,27 @@ ${list}
 
   let lastErr = null;
   for (const model of order) {
-    const useBasicFirst = cached && cached.model === model && cached.basic;
+    const useBasicFirst = !!(cached && cached.model === model && cached.basic);
     try {
-      const r = await requestModel(model, useBasicFirst ? bodyBasic : bodyWithThinkingOff);
-      setCachedGemini(model, !!useBasicFirst);
+      const r = await requestModel(model, makeBody(model, useBasicFirst));
+      setCachedGemini(model, useBasicFirst);
       return r;
     } catch (e) {
       lastErr = e;
-      // thinkingConfig 옵션 미지원 에러 시 기본 호출로 즉시 폴백
+      if (e.cancelled) throw e;
+      // 생각 옵션 미지원(400) → 같은 모델에 기본 옵션으로 즉시 재호출
       if (!useBasicFirst && e.status === 400 && /thinking/i.test(e.message)) {
         try {
-          const r = await requestModel(model, bodyBasic);
+          const r = await requestModel(model, makeBody(model, true));
           setCachedGemini(model, true);
           return r;
         } catch (e2) {
           lastErr = e2;
+          if (e2.cancelled) throw e2;
         }
       }
-      // 모델 미존재/지원 종료 시에만 다음 백업 모델로 이동
-      if (isModelGoneError(lastErr)) {
+      // 모델 종료 / 시간 초과 / 서버 혼잡(429·5xx) / 응답 오류 → 다음 모델로
+      if (isModelGoneError(lastErr) || lastErr.retry || lastErr.status === 429 || lastErr.status >= 500) {
         if (cached && cached.model === model) clearCachedGemini();
         continue;
       }
@@ -1062,38 +1087,58 @@ async function generateAllAwards() {
   }
 
   const total = targets.length;
-  let done = 0, failed = 0;
+  let done = 0, failed = 0, cancelled = false;
   const BATCH_SIZE = 5;
+  startAiCancel();
   showLoading(`⚡ AI 상장 초고속 일괄 생성 중... (0 / ${total}명)`);
+  const runOne = async name => {
+    if (cancelled) return;
+    const key = safeKey(name);
+    const texts = getPraises(name).map(p => p.text);
+    try {
+      const r = await callGemini(name, texts);
+      state.awards[key] = makeAward(name, r.title, r.body);
+      done++;
+    } catch (err) {
+      if (err.cancelled) { cancelled = true; return; }
+      console.error(`${name} 상장 생성 실패:`, err);
+      failed++;
+    }
+    setLoading(`⚡ AI 상장 초고속 일괄 생성 중... (${done + failed} / ${total}명 완료)`);
+  };
   try {
-    for (let i = 0; i < total; i += BATCH_SIZE) {
-      const batch = targets.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map(async name => {
-        const key = safeKey(name);
-        const texts = getPraises(name).map(p => p.text);
-        try {
-          const r = await callGemini(name, texts);
-          state.awards[key] = makeAward(name, r.title, r.body);
-          done++;
-        } catch (err) {
-          console.error(`${name} 상장 생성 실패:`, err);
-          failed++;
-        }
-        setLoading(`⚡ AI 상장 초고속 일괄 생성 중... (${done + failed} / ${total}명 완료)`);
-      }));
+    // 첫 1명으로 '작동하는 모델'을 먼저 찾아 기억 → 나머지는 그 모델로 바로 병렬 호출
+    await runOne(targets[0]);
+    saveState();
+    for (let i = 1; i < total && !cancelled; i += BATCH_SIZE) {
+      await Promise.all(targets.slice(i, i + BATCH_SIZE).map(runOne));
       saveState();
       renderChips();
       renderCertPreview();
     }
-    celebrate();
-    if (failed > 0) {
+    renderChips();
+    renderCertPreview();
+    if (cancelled) {
+      toast(`✋ 취소했어요. (${done}명 완료 · 버튼을 다시 누르면 남은 학생만 이어서 만들어요)`, 4000);
+    } else if (failed > 0) {
       alert(`✅ ${done}명 생성 완료! (${failed}명은 일시적 오류로 실패했어요. 한 번 더 버튼을 누르면 실패한 학생만 이어서 만듭니다.)`);
     } else {
+      celebrate();
       toast(`🎉 ${done}명 전체 AI 상장이 순식간에 완성되었어요!`, 3800);
     }
   } finally {
+    endAiCancel();
     hideLoading();
   }
+}
+
+function startAiCancel() {
+  aiCancelCtrl = new AbortController();
+  $('#btnCancelAi').classList.remove('hidden');
+}
+function endAiCancel() {
+  aiCancelCtrl = null;
+  $('#btnCancelAi').classList.add('hidden');
 }
 
 async function generateAward() {
@@ -1109,6 +1154,7 @@ async function generateAward() {
   const texts = getPraises(name).map(p => p.text);
   if (!texts.length && !confirm('아직 받은 칭찬이 없어요. 그래도 AI 상장을 만들까요?')) return;
 
+  startAiCancel();
   showLoading(`✨ AI가 ${name} 학생의 칭찬 ${texts.length}개를 모아 상장을 만들고 있어요...`);
   try {
     const r = await callGemini(name, texts);
@@ -1121,8 +1167,12 @@ async function generateAward() {
     toast(`🏅 '${r.title}' 완성! 글자를 눌러 고칠 수 있어요`, 3500);
   } catch (e) {
     console.error(e);
-    alert('상장 문구를 만들지 못했어요 😢\n\n' + e.message + '\n\nAPI 키와 인터넷 연결을 확인해 주세요.');
+    endAiCancel();
+    hideLoading();
+    const why = e.cancelled ? '취소했어요.' : '상장 문구를 만들지 못했어요 😢\n\n' + e.message;
+    if (confirm(why + '\n\n대신 기본 양식으로 상장을 만들고 직접 고칠까요?')) blankAward(true);
   } finally {
+    endAiCancel();
     hideLoading();
   }
 }
@@ -1575,6 +1625,10 @@ function initTeacher() {
   $('#btnExcel').addEventListener('click', downloadExcel);
   $('#btnPdfAll').addEventListener('click', downloadAllPdf);
   $('#btnReset').addEventListener('click', resetAll);
+  $('#btnCancelAi').addEventListener('click', () => {
+    if (aiCancelCtrl) aiCancelCtrl.abort();
+    setLoading('✋ 취소하는 중...');
+  });
 
   // 상장 프리뷰 크기 자동 조절
   if (window.ResizeObserver) new ResizeObserver(scalePreview).observe($('#certViewport'));
