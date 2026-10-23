@@ -480,7 +480,9 @@ textarea { resize: vertical; line-height: 1.5; }
 const BG_URL     = 'https://raw.githubusercontent.com/sae6gnicky/awardceremony/main/bgimage.png';
 const STORE_KEY  = 'woori_award_ceremony_v1';
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+// 구글 API 오류 메시지가 직접 권장하는 최신 모델을 1순위로, 항상 최신 Flash를 가리키는 별칭을 2순위로 둠
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
+const GEMINI_CACHE_KEY = 'woori_award_gemini_model_v2';
 const CERT_W = 794, CERT_H = 1123;   // A4 (96dpi) 비율
 
 // 별도 회원가입/설정 없이 바로 동작하는 무료 공개 실시간 통신 서버 (다중 백업 구성)
@@ -997,26 +999,53 @@ ${list}
     return { title: String(obj.title).trim(), body: String(obj.body).trim() };
   }
 
+  // 한 번 성공한 모델/옵션을 기억해 두었다가 다음부터는 바로 그 모델로 호출 (재시도 낭비 제거)
+  const cached = getCachedGemini();
+  const order = cached && GEMINI_MODELS.includes(cached.model)
+    ? [cached.model, ...GEMINI_MODELS.filter(m => m !== cached.model)]
+    : GEMINI_MODELS.slice();
+
   let lastErr = null;
-  for (const model of GEMINI_MODELS) {
+  for (const model of order) {
+    const useBasicFirst = cached && cached.model === model && cached.basic;
     try {
-      return await requestModel(model, bodyWithThinkingOff);
+      const r = await requestModel(model, useBasicFirst ? bodyBasic : bodyWithThinkingOff);
+      setCachedGemini(model, !!useBasicFirst);
+      return r;
     } catch (e) {
       lastErr = e;
       // thinkingConfig 옵션 미지원 에러 시 기본 호출로 즉시 폴백
-      if (e.status === 400 && /thinking/i.test(e.message)) {
+      if (!useBasicFirst && e.status === 400 && /thinking/i.test(e.message)) {
         try {
-          return await requestModel(model, bodyBasic);
+          const r = await requestModel(model, bodyBasic);
+          setCachedGemini(model, true);
+          return r;
         } catch (e2) {
           lastErr = e2;
         }
       }
       // 모델 미존재/지원 종료 시에만 다음 백업 모델로 이동
-      if (lastErr.status === 404 || /no longer available|not found|not supported/i.test(lastErr.message)) continue;
+      if (isModelGoneError(lastErr)) {
+        if (cached && cached.model === model) clearCachedGemini();
+        continue;
+      }
       throw lastErr;
     }
   }
   throw lastErr || new Error('AI 모델 호출에 실패했어요.');
+}
+
+function isModelGoneError(e) {
+  return !!e && (e.status === 404 || /no longer available|not found|not supported|is not available/i.test(e.message || ''));
+}
+function getCachedGemini() {
+  try { return JSON.parse(localStorage.getItem(GEMINI_CACHE_KEY)); } catch (e) { return null; }
+}
+function setCachedGemini(model, basic) {
+  try { localStorage.setItem(GEMINI_CACHE_KEY, JSON.stringify({ model, basic })); } catch (e) {}
+}
+function clearCachedGemini() {
+  try { localStorage.removeItem(GEMINI_CACHE_KEY); } catch (e) {}
 }
 
 async function generateAllAwards() {
