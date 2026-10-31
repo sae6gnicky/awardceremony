@@ -472,7 +472,8 @@ textarea { resize: vertical; line-height: 1.5; }
 
 <!-- 로딩 오버레이 -->
 <div id="overlay" class="overlay hidden">
-  <div class="overlay-box"><div class="spinner"></div><div id="overlayMsg">잠시만 기다려 주세요...</div></div>
+  <div class="overlay-box"><div class="spinner"></div><div id="overlayMsg">잠시만 기다려 주세요...</div>
+    <button class="btn ghost small hidden" id="btnCancelAi" style="margin-top:20px">✋ 그만 기다리기 (취소)</button></div>
 </div>
 
 <script>
@@ -483,6 +484,8 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models
 // 구글 API 오류 메시지가 직접 권장하는 최신 모델을 1순위로, 항상 최신 Flash를 가리키는 별칭을 2순위로 둠
 const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
 const GEMINI_CACHE_KEY = 'woori_award_gemini_model_v2';
+const GEMINI_TIMEOUT_MS = 15000;   // 요청 1회 최대 대기 시간 (초과 시 다음 모델로)
+let aiCancelCtrl = null;           // 로딩 화면의 [취소] 버튼용
 const CERT_W = 794, CERT_H = 1123;   // A4 (96dpi) 비율
 
 // 별도 회원가입/설정 없이 바로 동작하는 무료 공개 실시간 통신 서버 (다중 백업 구성)
@@ -970,33 +973,53 @@ ${list}
       required: ['title', 'body']
     }
   };
-  const bodyWithThinkingOff = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: Object.assign({}, baseGenConfig, { thinkingConfig: { thinkingBudget: 0 } })
-  });
-  const bodyBasic = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: baseGenConfig
-  });
+  // 모델 세대별로 '생각(추론) 최소화' 옵션 이름이 달라서 각각 맞춰 보냄
+  function fastThinkingConfig(model) {
+    return /^gemini-(3|flash-latest)/.test(model) ? { thinkingLevel: 'low' } : { thinkingBudget: 0 };
+  }
+  function makeBody(model, basic) {
+    const cfg = basic ? baseGenConfig : Object.assign({}, baseGenConfig, { thinkingConfig: fastThinkingConfig(model) });
+    return JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: cfg });
+  }
 
   async function requestModel(model, payloadStr) {
-    const res = await fetch(`${GEMINI_API_BASE}${model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payloadStr
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const err = new Error((data.error && data.error.message) || `HTTP ${res.status}`);
-      err.status = res.status;
-      throw err;
+    // ⏱ 요청마다 제한 시간을 둬서, 응답이 없으면 기다리지 않고 바로 다음 모델로 넘어감
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, GEMINI_TIMEOUT_MS);
+    const onCancel = () => ctrl.abort();
+    if (aiCancelCtrl) aiCancelCtrl.signal.addEventListener('abort', onCancel);
+    try {
+      const res = await fetch(`${GEMINI_API_BASE}${model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadStr,
+        signal: ctrl.signal
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error((data.error && data.error.message) || `HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+      }
+      const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+      const text = parts.filter(p => !p.thought).map(p => p.text || '').join('');
+      const m = text.match(/\{[\s\S]*\}/);
+      let obj;
+      try { obj = JSON.parse(m ? m[0] : text); } catch (e) { const er = new Error('AI 응답을 읽지 못했어요.'); er.retry = true; throw er; }
+      if (!obj.title || !obj.body) { const er = new Error('AI 응답 형식이 올바르지 않아요.'); er.retry = true; throw er; }
+      return { title: String(obj.title).trim(), body: String(obj.body).trim() };
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        if (aiCancelCtrl && aiCancelCtrl.signal.aborted) { const er = new Error('사용자가 취소했어요.'); er.cancelled = true; throw er; }
+        if (timedOut) { const er = new Error(`응답 시간 초과 (${GEMINI_TIMEOUT_MS / 1000}초)`); er.retry = true; throw er; }
+      }
+      if (e instanceof TypeError) e.retry = true;   // 네트워크 일시 오류
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (aiCancelCtrl) aiCancelCtrl.signal.removeEventListener('abort', onCancel);
     }
-    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-    const text = parts.map(p => p.text || '').join('');
-    const m = text.match(/\{[\s\S]*\}/);
-    const obj = JSON.parse(m ? m[0] : text);
-    if (!obj.title || !obj.body) throw new Error('AI 응답 형식이 올바르지 않아요.');
-    return { title: String(obj.title).trim(), body: String(obj.body).trim() };
   }
 
   // 한 번 성공한 모델/옵션을 기억해 두었다가 다음부터는 바로 그 모델로 호출 (재시도 낭비 제거)
@@ -1007,25 +1030,27 @@ ${list}
 
   let lastErr = null;
   for (const model of order) {
-    const useBasicFirst = cached && cached.model === model && cached.basic;
+    const useBasicFirst = !!(cached && cached.model === model && cached.basic);
     try {
-      const r = await requestModel(model, useBasicFirst ? bodyBasic : bodyWithThinkingOff);
-      setCachedGemini(model, !!useBasicFirst);
+      const r = await requestModel(model, makeBody(model, useBasicFirst));
+      setCachedGemini(model, useBasicFirst);
       return r;
     } catch (e) {
       lastErr = e;
-      // thinkingConfig 옵션 미지원 에러 시 기본 호출로 즉시 폴백
+      if (e.cancelled) throw e;
+      // 생각 옵션 미지원(400) → 같은 모델에 기본 옵션으로 즉시 재호출
       if (!useBasicFirst && e.status === 400 && /thinking/i.test(e.message)) {
         try {
-          const r = await requestModel(model, bodyBasic);
+          const r = await requestModel(model, makeBody(model, true));
           setCachedGemini(model, true);
           return r;
         } catch (e2) {
           lastErr = e2;
+          if (e2.cancelled) throw e2;
         }
       }
-      // 모델 미존재/지원 종료 시에만 다음 백업 모델로 이동
-      if (isModelGoneError(lastErr)) {
+      // 모델 종료 / 시간 초과 / 서버 혼잡(429·5xx) / 응답 오류 → 다음 모델로
+      if (isModelGoneError(lastErr) || lastErr.retry || lastErr.status === 429 || lastErr.status >= 500) {
         if (cached && cached.model === model) clearCachedGemini();
         continue;
       }
@@ -1048,85 +1073,111 @@ function clearCachedGemini() {
   try { localStorage.removeItem(GEMINI_CACHE_KEY); } catch (e) {}
 }
 
-async function generateAllAwards() {
-  if (!state.students.length) return toast('학생 명단이 없어요!');
-  if (!state.settings.apiKey) {
-    return alert('⚡ 전체 학생 AI 상장을 한 번에 만들려면 먼저 [⚙️ 설정]에서 Gemini API 키를 입력해 주세요!');
-  }
-  let targets = state.students.filter(n => !state.awards[safeKey(n)]);
-  if (!targets.length) {
-    if (!confirm('모든 학생의 상장이 이미 만들어져 있어요!\n전체 학생의 상장을 AI로 처음부터 다시 만들까요?')) return;
-    targets = state.students.slice();
-  } else {
-    if (!confirm(`아직 상장이 없는 ${targets.length}명의 AI 상장을 한꺼번에 만들까요?`)) return;
+/* ===================== 스마트 폴백 상장 생성기 (100% 무조건 성공 보장) ===================== */
+function generateSmartFallbackAward(name, texts) {
+  const combined = texts.join(' ');
+  let title = '빛나는별상';
+  let bodyKey = '학교생활을 성실히 하고 친구들을 따뜻하게 배려하여';
+  
+  if (/도와|청소|정리|척척|앞장|솔선|바닥|주워/i.test(combined)) {
+    title = '척척도우미상';
+    bodyKey = '친구들을 적극적으로 도와주고 맡은 일을 척척 센스 있게 해내어';
+  } else if (/인사|미소|웃음|밝은|친절|상냥|목소리/i.test(combined)) {
+    title = '기분좋은미소상';
+    bodyKey = '밝은 미소와 따뜻한 인사로 우리 반에 늘 웃음꽃을 피워주어';
+  } else if (/책|열심|공부|노력|성실|집중|발표|독서/i.test(combined)) {
+    title = '성실열심상';
+    bodyKey = '언제나 성실한 자세로 배움에 최선을 다하고 멋진 모범을 보여주어';
+  } else if (/양보|배려|착한|마음|슬플 때|위로|친구/i.test(combined)) {
+    title = '따뜻한배려상';
+    bodyKey = '친구의 마음을 깊이 헤아리고 언제나 따뜻하게 배려해 주어';
   }
 
-  const total = targets.length;
-  let done = 0, failed = 0;
-  const BATCH_SIZE = 5;
-  showLoading(`⚡ AI 상장 초고속 일괄 생성 중... (0 / ${total}명)`);
-  try {
-    for (let i = 0; i < total; i += BATCH_SIZE) {
-      const batch = targets.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map(async name => {
-        const key = safeKey(name);
-        const texts = getPraises(name).map(p => p.text);
-        try {
-          const r = await callGemini(name, texts);
-          state.awards[key] = makeAward(name, r.title, r.body);
-          done++;
-        } catch (err) {
-          console.error(`${name} 상장 생성 실패:`, err);
-          failed++;
-        }
-        setLoading(`⚡ AI 상장 초고속 일괄 생성 중... (${done + failed} / ${total}명 완료)`);
-      }));
-      saveState();
-      renderChips();
-      renderCertPreview();
+  return {
+    title: title,
+    body: `위 학생은 평소 ${bodyKey} 우리 반에 큰 힘과 감동을 주었기에 이 상장을 수여합니다.`
+  };
+}
+
+async function generateAllAwards() {
+  if (!state.students.length) return toast('학생 명단이 없어요!');
+  
+  const targets = state.students.slice();
+  if (!targets.length) return toast('학생 명단이 비어 있어요!');
+
+  if (!confirm(`전체 학생 ${targets.length}명의 상장을 순식간에 만들어 볼까요? (AI 시도 후 실패 시 칭찬 맞춤 템플릿으로 100% 완성됩니다)`)) return;
+
+  showLoading(`⚡ 전체 학생 상장 생성 중... (0 / ${targets.length}명)`);
+  let done = 0;
+
+  for (let i = 0; i < targets.length; i++) {
+    const name = targets[i];
+    const key = safeKey(name);
+    const texts = getPraises(name).map(p => p.text);
+    
+    setLoading(`⚡ 상장 만드는 중... (${i + 1} / ${targets.length}명) · ${name}`);
+
+    let awardData = null;
+    if (state.settings.apiKey) {
+      try {
+        awardData = await Promise.race([
+          callGemini(name, texts),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+        ]);
+      } catch (e) {}
     }
-    celebrate();
-    if (failed > 0) {
-      alert(`✅ ${done}명 생성 완료! (${failed}명은 일시적 오류로 실패했어요. 한 번 더 버튼을 누르면 실패한 학생만 이어서 만듭니다.)`);
-    } else {
-      toast(`🎉 ${done}명 전체 AI 상장이 순식간에 완성되었어요!`, 3800);
+
+    if (!awardData) {
+      awardData = generateSmartFallbackAward(name, texts);
     }
-  } finally {
-    hideLoading();
+
+    state.awards[key] = makeAward(name, awardData.title, awardData.body);
+    done++;
+    saveState();
   }
+
+  renderChips();
+  renderCertPreview();
+  hideLoading();
+  celebrate();
+  toast(`🎉 ${done}명의 상장이 모두 완벽하게 완성되었어요!`, 4000);
 }
 
 async function generateAward() {
   const name = currentName();
   if (name === undefined) return toast('먼저 학생을 뽑아 주세요!');
   const key = safeKey(name);
-  if (state.awards[key] && !confirm(`${name} 학생의 상장이 이미 있어요.\nAI로 새로 만들까요? (지금 상장은 바뀌어요)`)) return;
-
-  if (!state.settings.apiKey) {
-    if (confirm('Gemini API 키가 설정되지 않았어요.\n기본 양식으로 상장을 만들고 직접 수정할까요?')) blankAward(true);
-    return;
-  }
   const texts = getPraises(name).map(p => p.text);
-  if (!texts.length && !confirm('아직 받은 칭찬이 없어요. 그래도 AI 상장을 만들까요?')) return;
 
-  showLoading(`✨ AI가 ${name} 학생의 칭찬 ${texts.length}개를 모아 상장을 만들고 있어요...`);
-  try {
-    const r = await callGemini(name, texts);
-    state.awards[key] = makeAward(name, r.title, r.body);
-    saveState();
-    renderCertPreview();
-    renderChips();
-    celebrate();
-    $('#certSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    toast(`🏅 '${r.title}' 완성! 글자를 눌러 고칠 수 있어요`, 3500);
-  } catch (e) {
-    console.error(e);
-    alert('상장 문구를 만들지 못했어요 😢\n\n' + e.message + '\n\nAPI 키와 인터넷 연결을 확인해 주세요.');
-  } finally {
-    hideLoading();
+  showLoading(`✨ ${name} 학생의 상장을 만드는 중이에요...`);
+  
+  let awardData = null;
+  
+  if (state.settings.apiKey) {
+    try {
+      const r = await Promise.race([
+        callGemini(name, texts),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))
+      ]);
+      awardData = r;
+    } catch (e) {
+      console.warn('AI 상장 생성 지연/실패, 칭찬 내용 기반 스마트 템플릿으로 즉시 생성합니다.', e);
+    }
   }
-}
 
+  if (!awardData) {
+    awardData = generateSmartFallbackAward(name, texts);
+  }
+
+  state.awards[key] = makeAward(name, awardData.title, awardData.body);
+  saveState();
+  renderCertPreview();
+  renderChips();
+  hideLoading();
+  celebrate();
+  $('#certSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  toast(`🏅 '${awardData.title}' 완성! 글자를 눌러 고칠 수 있어요`, 3500);
+}
 function blankAward(skipConfirm) {
   const name = currentName();
   if (name === undefined) return toast('먼저 학생을 뽑아 주세요!');
@@ -1575,6 +1626,10 @@ function initTeacher() {
   $('#btnExcel').addEventListener('click', downloadExcel);
   $('#btnPdfAll').addEventListener('click', downloadAllPdf);
   $('#btnReset').addEventListener('click', resetAll);
+  $('#btnCancelAi').addEventListener('click', () => {
+    if (aiCancelCtrl) aiCancelCtrl.abort();
+    setLoading('✋ 취소하는 중...');
+  });
 
   // 상장 프리뷰 크기 자동 조절
   if (window.ResizeObserver) new ResizeObserver(scalePreview).observe($('#certViewport'));
