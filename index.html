@@ -11,19 +11,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Jua&family=Gowun+Dodum&display=swap" rel="stylesheet">
 
 <!-- 외부 라이브러리 (CDN) -->
-<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js">
-/* ===================== 우클릭 및 단축키 방지 ===================== */
-document.addEventListener('contextmenu', e => e.preventDefault());
-document.addEventListener('keydown', e => {
-  if (
-    e.key === 'F12' ||
-    (e.ctrlKey && e.shiftKey && ['I', 'J', 'C', 'i', 'j', 'c'].includes(e.key)) ||
-    (e.ctrlKey && ['U', 'S', 'u', 's'].includes(e.key))
-  ) {
-    e.preventDefault();
-  }
-});
-</script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -1781,6 +1769,19 @@ function initTeacher() {
 /* ===================== 시작 ===================== */
 if (params.get('student')) initStudent();
 else initTeacher();
+
+/* ===================== 우클릭 · 드래그 · 단축키 차단 ===================== */
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('dragstart', e => e.preventDefault());
+document.addEventListener('keydown', e => {
+  if (
+    e.key === 'F12' ||
+    (e.ctrlKey && e.shiftKey && ['I', 'J', 'C', 'i', 'j', 'c'].includes(e.key)) ||
+    (e.ctrlKey && ['U', 'S', 'u', 's'].includes(e.key))
+  ) {
+    e.preventDefault();
+  }
+});
 </script>
 </body>
 </html>
