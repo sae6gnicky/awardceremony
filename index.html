@@ -11,7 +11,8 @@
 <link href="https://fonts.googleapis.com/css2?family=Jua&family=Gowun+Dodum&display=swap" rel="stylesheet">
 
 <!-- 외부 라이브러리 (CDN) -->
-<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js">
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script>
 /* ===================== 우클릭 및 단축키 방지 ===================== */
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('keydown', e => {
@@ -23,6 +24,7 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
   }
 });
+document.addEventListener('dragstart', e => e.preventDefault());
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -251,10 +253,11 @@ textarea { resize: vertical; line-height: 1.5; }
 .cert [contenteditable="true"]:hover { background: rgba(255, 201, 60, .18); }
 .cert [contenteditable="true"]:focus { background: rgba(255, 201, 60, .25); box-shadow: 0 0 0 3px rgba(255, 138, 61, .6); }
 .c-title {
-  position: absolute; top: 172px; left: 90px; right: 90px;
+  position: absolute; top: 172px; left: 75px; right: 75px;
   text-align: center;
   font-weight: bold;
   font-size: 72px; line-height: 1.25; letter-spacing: 10px;
+  white-space: nowrap !important;
 }
 .c-info {
   position: absolute; top: 345px; right: 135px;
@@ -342,6 +345,31 @@ textarea { resize: vertical; line-height: 1.5; }
   object-fit: contain;
   margin-left: auto;
   border-radius: 6px;
+}
+.title-ctrl-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.title-ctrl-row:last-child { margin-bottom: 0; }
+.title-ctrl-row span.lbl {
+  font-family: 'Jua', sans-serif;
+  font-size: 19px;
+  min-width: 78px;
+  color: var(--brown);
+}
+.title-ctrl-row input[type="range"] {
+  flex: 1;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.title-ctrl-row .val {
+  font-family: 'Jua', sans-serif;
+  font-size: 18px;
+  min-width: 54px;
+  text-align: right;
+  color: var(--primary-d);
 }
 #renderHost { position: absolute; top: 0; left: -12000px; width: 794px; pointer-events: none; }
 
@@ -503,6 +531,22 @@ textarea { resize: vertical; line-height: 1.5; }
           · 고친 내용은 자동으로 저장돼요 (새로고침해도 유지)<br>
           · 글이 길어지면 글자 크기가 자동으로 맞춰져요<br>
           · 만든 상장은 아래 <b>[전체 상장 PDF 일괄 다운로드]</b>에 포함돼요
+        </div>
+        <div class="stamp-box">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+            <h3 style="margin:0;">🔤 상장 이름 크기 · 자간 조절</h3>
+            <button type="button" class="btn ghost small" id="btnResetTitleStyle" style="padding:5px 12px;font-size:16px;">자동 맞춤</button>
+          </div>
+          <div class="title-ctrl-row">
+            <span class="lbl">글자 크기</span>
+            <input type="range" id="rngTitleSize" min="28" max="84" step="1" value="64">
+            <span class="val" id="valTitleSize">자동</span>
+          </div>
+          <div class="title-ctrl-row">
+            <span class="lbl">자간 간격</span>
+            <input type="range" id="rngTitleSpace" min="-4" max="20" step="1" value="6">
+            <span class="val" id="valTitleSpace">자동</span>
+          </div>
         </div>
         <div class="stamp-box">
           <h3>💮 직인 도장 선택</h3>
@@ -964,19 +1008,72 @@ function createCert(award, editable) {
   return c;
 }
 
-/* 글자 수에 따라 제목·본문 크기 자동 맞춤 */
-function fitCert(c) {
+/* 글자 수에 따라 제목(1줄 고정)·본문 크기 및 자간 자동 맞춤 + 수동 조절 지원 */
+function fitCert(c, award) {
   const t = c.querySelector('.c-title');
-  const len = [...(t.textContent || '').replace(/\s/g, '')].length;
-  let ts = len <= 7 ? 74 : len <= 9 ? 64 : len <= 12 ? 54 : len <= 16 ? 44 : 38;
-  t.style.letterSpacing = len <= 9 ? '10px' : '4px';
-  t.style.fontSize = ts + 'px';
-  while (t.offsetHeight > 165 && ts > 26) { ts -= 2; t.style.fontSize = ts + 'px'; }
+  const rawText = (t.textContent || '').replace(/\r?\n/g, ' ').trim();
+  if (t.textContent !== rawText) t.textContent = rawText;
+  const len = [...rawText.replace(/\s/g, '')].length;
+
+  let ts, ls;
+  const hasCustomSize = award && typeof award.titleSize === 'number';
+  const hasCustomSpace = award && typeof award.titleSpacing === 'number';
+
+  if (hasCustomSize || hasCustomSpace) {
+    ts = hasCustomSize ? award.titleSize : (len <= 6 ? 72 : len <= 8 ? 64 : len <= 10 ? 56 : 48);
+    ls = hasCustomSpace ? award.titleSpacing : (len <= 7 ? 8 : len <= 9 ? 4 : 1);
+    t.style.fontSize = ts + 'px';
+    t.style.letterSpacing = ls + 'px';
+  } else {
+    ts = len <= 6 ? 72 : len <= 7 ? 68 : len <= 8 ? 62 : len <= 9 ? 56 : len <= 10 ? 52 : len <= 12 ? 46 : 40;
+    ls = len <= 6 ? 10 : len <= 7 ? 8 : len <= 8 ? 5 : len <= 9 ? 3 : 1;
+    t.style.fontSize = ts + 'px';
+    t.style.letterSpacing = ls + 'px';
+
+    // 한 줄에 깔끔하게 들어오도록 자간을 먼저 줄이고, 그래도 넘치면 글자 크기를 줄임
+    const maxW = t.clientWidth || 644;
+    while (t.scrollWidth > maxW && ls > -2) {
+      ls -= 1;
+      t.style.letterSpacing = ls + 'px';
+    }
+    while (t.scrollWidth > maxW && ts > 26) {
+      ts -= 1;
+      t.style.fontSize = ts + 'px';
+    }
+  }
 
   const b = c.querySelector('.c-body');
   let bs = 40;
   b.style.fontSize = bs + 'px';
   while (b.offsetHeight > 350 && bs > 20) { bs -= 1; b.style.fontSize = bs + 'px'; }
+
+  if (c === previewCert) syncTitleSliders(award, ts, ls);
+}
+
+function syncTitleSliders(award, autoSize, autoSpace) {
+  const rngSize = $('#rngTitleSize');
+  const rngSpace = $('#rngTitleSpace');
+  const valSize = $('#valTitleSize');
+  const valSpace = $('#valTitleSpace');
+  if (!rngSize || !rngSpace) return;
+
+  const noAward = !award;
+  rngSize.disabled = noAward;
+  rngSpace.disabled = noAward;
+  if ($('#btnResetTitleStyle')) $('#btnResetTitleStyle').disabled = noAward;
+
+  if (noAward) {
+    valSize.textContent = '-';
+    valSpace.textContent = '-';
+    return;
+  }
+
+  const sz = typeof award.titleSize === 'number' ? award.titleSize : (autoSize || 64);
+  const sp = typeof award.titleSpacing === 'number' ? award.titleSpacing : (autoSpace != null ? autoSpace : 6);
+  rngSize.value = sz;
+  rngSpace.value = sp;
+  valSize.textContent = (typeof award.titleSize === 'number' ? `${sz}px` : `자동(${sz})`);
+  valSpace.textContent = (typeof award.titleSpacing === 'number' ? `${sp}px` : `자동(${sp})`);
 }
 
 /* ===================== 상장 프리뷰 (편집 가능) ===================== */
@@ -1000,6 +1097,7 @@ function renderCertPreview() {
 
   syncStampRadios();
   if (!award) {
+    syncTitleSliders(null);
     vp.innerHTML = `<div class="cert-empty"><div class="big-emoji">📜</div>
       <div>${noStudent ? '먼저 학생을 뽑아 주세요!' : '✨ [상장 만들기] 버튼을 누르면<br>AI가 친구들의 칭찬을 모아<br>멋진 상장을 만들어 줘요!'}</div></div>`;
     return;
@@ -1009,7 +1107,7 @@ function renderCertPreview() {
   vp.appendChild(c);
   previewCert = c;
   scalePreview();
-  fitCert(c);
+  fitCert(c, award);
 
   c.querySelectorAll('[data-f]').forEach(el => {
     const f = el.dataset.f;
@@ -1017,7 +1115,7 @@ function renderCertPreview() {
       award[f] = el.innerText.replace(/\n+$/, '');   // ✅ 수정 즉시 내부 데이터 + localStorage 반영
       state.awards[safeKey(name)] = award;
       saveState();
-      if (f === 'title' || f === 'body') fitCert(c);
+      if (f === 'title' || f === 'body') fitCert(c, award);
     });
     el.addEventListener('paste', e => {
       e.preventDefault();
@@ -1041,7 +1139,7 @@ async function renderCertCanvas(award, scale = 2) {
   if (stImg && !stImg.classList.contains('hidden') && stImg.getAttribute('src')) {
     await waitImg(stImg);
   }
-  fitCert(c);
+  fitCert(c, award);
   const canvas = await html2canvas(c, {
     scale: scale,
     useCORS: true,
@@ -1743,6 +1841,32 @@ function initTeacher() {
   $('#btnMakeAllAwards').addEventListener('click', generateAllAwards);
   $('#btnMakeAllAwardsBottom').addEventListener('click', generateAllAwards);
   $('#btnBlankAward').addEventListener('click', () => blankAward(false));
+  $('#rngTitleSize').addEventListener('input', e => {
+    const name = currentName();
+    const award = name !== undefined ? state.awards[safeKey(name)] : null;
+    if (!award || !previewCert) return;
+    award.titleSize = Number(e.target.value);
+    saveState();
+    fitCert(previewCert, award);
+  });
+  $('#rngTitleSpace').addEventListener('input', e => {
+    const name = currentName();
+    const award = name !== undefined ? state.awards[safeKey(name)] : null;
+    if (!award || !previewCert) return;
+    award.titleSpacing = Number(e.target.value);
+    saveState();
+    fitCert(previewCert, award);
+  });
+  $('#btnResetTitleStyle').addEventListener('click', () => {
+    const name = currentName();
+    const award = name !== undefined ? state.awards[safeKey(name)] : null;
+    if (!award || !previewCert) return;
+    delete award.titleSize;
+    delete award.titleSpacing;
+    saveState();
+    fitCert(previewCert, award);
+    toast('✨ 상장 이름 크기·자간을 한 줄 자동 맞춤으로 되돌렸어요');
+  });
   $$('#stampOptions input[name="certStamp"]').forEach(radio => {
     radio.addEventListener('change', () => {
       const val = radio.value || 'none';
@@ -1772,7 +1896,11 @@ function initTeacher() {
   window.addEventListener('resize', scalePreview);
 
   // 상장 폰트 미리 로드 후 프리뷰 다시 맞춤
-  ensureAssets().then(() => { if (previewCert) fitCert(previewCert); });
+  ensureAssets().then(() => {
+    const name = currentName();
+    const award = name !== undefined ? state.awards[safeKey(name)] : null;
+    if (previewCert) fitCert(previewCert, award);
+  });
 
   if (state.started && state.students.length && state.settings.grade) enterCeremony();
   else showSetup();
